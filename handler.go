@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/apache/arrow/go/arrow/memory"
+	"github.com/apache/arrow/go/v10/arrow/array"
 	pfile "github.com/apache/arrow/go/v10/parquet/file"
 	"github.com/apache/arrow/go/v10/parquet/pqarrow"
 	"github.com/aws/aws-sdk-go/aws"
@@ -26,6 +27,7 @@ type AwsDiskUsageHandler struct {
 	s3Downloader  *s3manager.Downloader
 	inventoryPath string
 	cron          *cron.Cron
+	diskUsageMap  map[string]mailiotypes.DiskUsage
 }
 
 // inventoryPath from docs: https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory-location.html
@@ -49,6 +51,7 @@ func NewAwsDiskUsageHandler(apiKey, secret, region, inventoryPath string, refres
 		s3Downloader:  downloader,
 		inventoryPath: inventoryPath,
 		cron:          cron,
+		diskUsageMap:  make(map[string]mailiotypes.DiskUsage), // empty map
 	}
 	pattern := fmt.Sprintf("@every %ds", refreshPeriodSeconds)
 	handler.start(pattern)
@@ -58,12 +61,8 @@ func NewAwsDiskUsageHandler(apiKey, secret, region, inventoryPath string, refres
 
 // start cron job
 func (du *AwsDiskUsageHandler) start(pattern string) {
-	du.cron.AddFunc(pattern, func() {
-		err := du.executeJob()
-		if err != nil {
-			log.Printf("Error executing job: %v", err)
-		}
-	})
+	du.cron.AddFunc(pattern, du.executeJob)
+	du.cron.Start()
 }
 
 // stop cron job
@@ -75,11 +74,11 @@ func (du *AwsDiskUsageHandler) Stop() {
 // executeJob downloads the manifest JSON file from the S3 bucket and processes the parquet files
 // listed in the manifest JSON file. The parquet files are downloaded and parsed using the Arrow
 // library. Results are stored in memory for further processing of the external project.
-func (du *AwsDiskUsageHandler) executeJob() error {
+func (du *AwsDiskUsageHandler) executeJob() {
 	manifestJson, err := du.getAWSManifestJson(time.Now())
 	if err != nil {
 		log.Printf("Error getting manifest json: %v", err)
-		return err
+		return
 	}
 	for _, file := range manifestJson.Files {
 		log.Printf("Key: %s, Size: %d", file.Key, file.Size)
@@ -90,7 +89,6 @@ func (du *AwsDiskUsageHandler) executeJob() error {
 		}
 		du.parseParquet(parquetBytes)
 	}
-	return nil
 }
 
 // getAWSManifestJson constructs the S3 object key for the AWS manifest JSON file
@@ -105,6 +103,7 @@ func (du *AwsDiskUsageHandler) executeJob() error {
 func (du *AwsDiskUsageHandler) getAWSManifestJson(dt time.Time) (*Inventory, error) {
 	// modify the time to be at 1AM UTC
 	dt = time.Date(dt.Year(), dt.Month(), dt.Day(), 1, 0, 0, 0, time.UTC)
+
 	formattedDate := dt.Format("2006-01-02T15-04Z")
 
 	s3Path := strings.TrimPrefix(du.inventoryPath, "s3://")
@@ -164,6 +163,10 @@ func (du *AwsDiskUsageHandler) downloadBytes(bucket string, item string) ([]byte
 	return buff.Bytes(), nil
 }
 
+// parseParquet parses the parquet file and stores the disk usage information in memory.
+// The parquet file contains multiple columns of which two are of our interest: key and size. The key column contains the user
+// address and the size column contains the size of the attachment. The function reads the parquet file in batches and
+// stores the disk usage information in a map.
 func (du *AwsDiskUsageHandler) parseParquet(parquetBytes []byte) {
 	// Create a bytes reader
 	buf := bytes.NewReader(parquetBytes)
@@ -189,16 +192,71 @@ func (du *AwsDiskUsageHandler) parseParquet(parquetBytes []byte) {
 		log.Fatalf("Failed to read Parquet file into Arrow Table: %v", err)
 	}
 	log.Printf("Num rows read: %d", table.NumRows())
-	// Iterate over the record batches and print data
-	for i := 0; i < int(table.NumRows()); i++ {
-		for j := 0; j < int(table.NumCols()); j++ {
-			column := table.Column(0)
-			log.Printf("column name: %s", column.Name())
+
+	batchSize := int64(5)
+	tr := array.NewTableReader(table, batchSize)
+	defer tr.Release()
+
+	fileKeysArray := []string{}
+	sizesArray := []int64{}
+
+	for tr.Next() {
+		rec := tr.Record()
+		for i, col := range rec.Columns() {
+			arrData := col.Data()
+			switch rec.ColumnName(i) {
+			case "size":
+				for bi := 0; bi < arrData.Len(); bi++ {
+					size := array.NewInt64Data(arrData).Value(bi)
+					sizesArray = append(sizesArray, size)
+				}
+			case "key":
+				for bi := 0; bi < arrData.Len(); bi++ {
+					key := array.NewStringData(arrData).Value(bi)
+					fileKeysArray = append(fileKeysArray, key)
+				}
+			default:
+				continue
+			}
 		}
 	}
+
+	log.Printf("files: %d, sizes: %d", len(fileKeysArray), len(sizesArray))
+	if len(fileKeysArray) != len(sizesArray) { // sanity check
+		log.Printf("Error: fileKeysArray and sizesArray have different lengths")
+		return // skip this batch
+	}
+
+	// Create a map of addresses to sizes
+	diskUsageMap := make(map[string]mailiotypes.DiskUsage)
+	for i, fileKey := range fileKeysArray {
+		size := sizesArray[i]
+		fileKeyParts := strings.Split(fileKey, "/")
+		if len(fileKeyParts) < 2 {
+			log.Printf("Error: invalid file key: %s", fileKey)
+			continue
+		}
+		address := fileKeyParts[0]
+		if du, ok := diskUsageMap[address]; ok {
+			du.SizeBytes += size
+			du.NumberFiles += 1
+			diskUsageMap[address] = du
+		} else {
+			diskUsageMap[address] = mailiotypes.DiskUsage{
+				Address:     address,
+				SizeBytes:   size,
+				NumberFiles: 1,
+			}
+		}
+	}
+	du.diskUsageMap = diskUsageMap
 }
 
+// GetDiskUsage returns the disk usage for the given user address.
+// If the disk usage is not found, the function returns an NotFoundError.
 func (h *AwsDiskUsageHandler) GetDiskUsage(userAddress string) (*mailiotypes.DiskUsage, error) {
-
-	return nil, nil
+	if du, ok := h.diskUsageMap[userAddress]; ok {
+		return &du, nil
+	}
+	return nil, ErrNotFound
 }

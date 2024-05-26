@@ -3,7 +3,7 @@ package awsdiskusagehandler
 import "errors"
 
 // custom errors
-var ErrNotFound = errors.New("not found")
+var ErrNotFound = errors.New("item not found")
 
 // file structure specifically for Parquest format
 // Example:
