@@ -59,6 +59,6 @@ region=us-east-1
 
 Checkout the `handler_test.go` and `handler.go`
 
-
+[Read AWS Intenvory docs](https://docs.aws.amazon.com/AmazonS3/latest/userguide/storage-inventory.html)
 
 
